@@ -4,7 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"time"
-
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
@@ -95,7 +95,8 @@ func newPvcController(kubeconfig string) *pvcController {
 }
 
 func (pvc *pvcController) Run(workers int, stopCh <-chan struct{}) {
-
+	defer utilruntime.HandleCrash()
+	defer pvc.podsQueue.ShutDown()
 	fmt.Println("Starting pvc controller")
 	go pvc.controller.Run(stopCh)
 
@@ -109,7 +110,7 @@ func (pvc *pvcController) Run(workers int, stopCh <-chan struct{}) {
 
 	<-stopCh
 	fmt.Printf("Shutting down pvc Controller")
-	pvc.podsQueue.ShutDown()
+
 }
 
 func (pvc *pvcController) runWorker() {
