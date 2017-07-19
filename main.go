@@ -14,8 +14,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	corev1 "k8s.io/api/core/v1"
-
 	"github.com/golang/glog"
+	"strings"
 )
 
 func getClientsetOrDie(kubeconfig string) *kubernetes.Clientset {
@@ -102,6 +102,7 @@ func (pvc *pvcController) Run(workers int, stopCh <-chan struct{}) {
 	if !cache.WaitForCacheSync(stopCh, pvc.controller.HasSynced) {
 		return
 	}
+
 	for i := 0; i < workers; i++ {
 		go wait.Until(pvc.runWorker, time.Second, stopCh)
 	}
@@ -119,10 +120,20 @@ func (pvc *pvcController) runWorker() {
 			return true
 		}
 		defer pvc.podsQueue.Done(key)
-
 		obj, exists, err := pvc.podStore.GetByKey(key.(string))
 		if !exists {
 			fmt.Printf("Pod has been deleted %v\n", key)
+			pod := obj.(*corev1.Pod)
+			err, p := getPvcByPod(pod, pvc.kubeClient)
+			if err != nil || p == nil {
+				return false
+			}
+			pvcAnnotation := getPvcAnnotation(p)
+			if pvcAnnotation == nil {
+				return false
+			}
+			delete(pvcAnnotation, pod.Name)
+			updatePvcAnnotation(pvcAnnotation, pvc.kubeClient, p)
 			return false
 		}
 		if err != nil {
@@ -131,9 +142,20 @@ func (pvc *pvcController) runWorker() {
 		}
 
 		pod := obj.(*corev1.Pod)
+		glog.Info("get pod:", pod.Namespace, pod.Name)
+		err, p := getPvcByPod(pod, pvc.kubeClient)
+		if err != nil || p == nil {
+			return false
+		}
+		glog.Info("get pod pvc:", pod.Namespace, p.Name)
 
-		fmt.Println(pod.Name)
-		//TODO update pvc annotation
+		pvcAnnotation := getPvcAnnotation(p)
+		glog.Info("get pvc annotation:", pvcAnnotation)
+		if pvcAnnotation == nil {
+			pvcAnnotation = make(map[string]int, 0)
+		}
+		pvcAnnotation[pod.Name] = 0
+		updatePvcAnnotation(pvcAnnotation, pvc.kubeClient, p)
 		return false
 	}
 	for {
@@ -142,4 +164,48 @@ func (pvc *pvcController) runWorker() {
 			return
 		}
 	}
+}
+
+func getPvcAnnotation(pvc *corev1.PersistentVolumeClaim) (map[string]int) {
+	if values, ok := pvc.Annotations["kubernetes-admin.caicloud.io/used-by"]; ok {
+		value := strings.Split(values, ",")
+		podNameMap := make(map[string]int)
+		for _, v := range value {
+			podNameMap[v] = 0
+		}
+		return podNameMap
+	}
+	return nil
+}
+
+func getPvcByPod(pod *corev1.Pod, clientset *kubernetes.Clientset) (error, *corev1.PersistentVolumeClaim) {
+	if len(pod.Spec.Volumes) != 0 {
+		for _, volume := range pod.Spec.Volumes {
+			if volume.PersistentVolumeClaim != nil {
+				pvc, err := clientset.CoreV1().PersistentVolumeClaims(pod.Namespace).Get(volume.PersistentVolumeClaim.ClaimName, v1.GetOptions{})
+				if err != nil {
+					glog.Info(err)
+					return err, nil
+				}
+				return nil, pvc
+			}
+		}
+	}
+	return nil, nil
+}
+
+func updatePvcAnnotation(annotation map[string]int, clientset *kubernetes.Clientset, pvc *corev1.PersistentVolumeClaim) {
+	annotationValues := ""
+	for values, _ := range annotation {
+		annotationValues += "," + values
+	}
+
+	annotations := strings.TrimLeft(annotationValues, ",")
+	pvc.Annotations["kubernetes-admin.caicloud.io/used-by"] = annotations
+
+	pvc, err := clientset.PersistentVolumeClaims(pvc.Namespace).Update(pvc)
+	if err != nil {
+		glog.Error(err)
+	}
+	glog.Info("updated pvc annotation:", pvc.Annotations)
 }
